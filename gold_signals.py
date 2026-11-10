@@ -40,6 +40,9 @@ YF_INTERVAL = {"5m": "5m", "15m": "15m", "1h": "60m"}
 YF_PERIOD = {"5m": "30d", "15m": "30d", "1h": "180d"}
 HTF = {"5m": "1h", "15m": "1h", "1h": None}   # higher-timeframe trend filter
 TRADES_FILE = "trades.csv"
+STATE_FILE = "state.json"
+MAX_BARS = {"5m": 24, "15m": 16, "1h": 12}      # time exit: 2h / 4h / 12h
+CLOSED = ["TP", "SL", "TIME"]
 TRADE_COLS = ["id", "tf", "side", "signal_time", "entry", "sl", "tp",
               "status", "exit_time", "exit", "pnl"]
 
@@ -286,7 +289,7 @@ def tg_get_chat_ids():
 
 
 def stats_line(trades: pd.DataFrame) -> str:
-    closed = trades[trades["status"].isin(["TP", "SL"])]
+    closed = trades[trades["status"].isin(CLOSED)]
     if closed.empty:
         return "Total: no closed trades yet"
     pnl = pd.to_numeric(closed["pnl"]).to_numpy()
@@ -302,25 +305,28 @@ def load_trades(path=TRADES_FILE) -> pd.DataFrame:
 
 
 def update_trades(trades: pd.DataFrame, data: dict, alerts: list | None = None) -> pd.DataFrame:
-    """Close OPEN trades whose SL/TP was touched by candles after the entry candle."""
+    """Close OPEN trades on SL / TP touch (candle high/low) or after MAX_BARS candles."""
     for i in trades.index[trades["status"] == "OPEN"]:
         row = trades.loc[i]
         side = 1 if row.side == "BUY" else -1
         entry, sl, tp = float(row.entry), float(row.sl), float(row.tp)
         bars = data[row.tf]
         bars = bars[bars.index > pd.Timestamp(row.signal_time)]
-        for ts, b in bars.iterrows():
+        for n, (ts, b) in enumerate(bars.iterrows(), start=1):
             hit_sl = b.low <= sl if side == 1 else b.high >= sl
             hit_tp = b.high >= tp if side == 1 else b.low <= tp
+            status = exit_p = None
             if hit_sl or hit_tp:      # conservative: SL first if both touched
-                exit_p = sl if hit_sl else tp
+                status, exit_p = ("SL", sl) if hit_sl else ("TP", tp)
+            elif n >= MAX_BARS.get(row.tf, 24):
+                status, exit_p = "TIME", float(b.close)
+            if status:
+                pnl_v = (exit_p - entry) * side
                 trades.loc[i, ["status", "exit_time", "exit", "pnl"]] = [
-                    "SL" if hit_sl else "TP", ts.isoformat(),
-                    round(exit_p, 2), round((exit_p - entry) * side, 2)]
+                    status, ts.isoformat(), round(exit_p, 2), round(pnl_v, 2)]
                 if alerts is not None:
-                    pnl_v = (exit_p - entry) * side
-                    alerts.append(f"{'✅ TP hit' if hit_tp and not hit_sl else '❌ SL hit'} — "
-                                  f"XAUUSD {row.tf} {row.side} #{row.id}\n"
+                    head = {"TP": "✅ TP hit", "SL": "❌ SL hit", "TIME": "⏱ Time exit"}[status]
+                    alerts.append(f"{head} — XAUUSD {row.tf} {row.side} #{row.id}\n"
                                   f"Entry {entry:.2f} → Exit {exit_p:.2f} ({pnl_v:+.2f} pts)")
                 break
     return trades
@@ -343,13 +349,55 @@ def open_trade(trades: pd.DataFrame, sig: Signal, alerts: list | None = None) ->
         icon = "🟢" if sig.action == "BUY" else "🔴"
         alerts.append(f"{icon} {sig.action} XAUUSD {sig.tf}\n"
                       f"Price {sig.price:.2f}\nSL {sig.sl:.2f} | TP {sig.tp:.2f}\n"
-                      f"{sig.reason}")
+                      f"{sig.reason}\n(price source: GC=F futures; broker spot may differ)")
     return pd.concat([trades, pd.DataFrame([new], dtype=object)], ignore_index=True)
 
 
-def print_stats(trades: pd.DataFrame):
+def open_trade_info(t, data):
+    df = data[t.tf]
+    if df.empty:
+        return None
+    side = 1 if t.side == "BUY" else -1
+    entry, sl, tp = float(t.entry), float(t.sl), float(t.tp)
+    bars = df[df.index > pd.Timestamp(t.signal_time)]
+    now = float(df.close.iloc[-1])
+    return dict(now=now, pnl=(now - entry) * side, to_tp=(tp - now) * side,
+                to_sl=(now - sl) * side,
+                hi=float(bars.high.max()) if len(bars) else entry,
+                lo=float(bars.low.min()) if len(bars) else entry,
+                n=len(bars), max_n=MAX_BARS.get(t.tf, 24))
+
+
+def status_message(open_: pd.DataFrame, data: dict) -> str:
+    lines = ["📊 Open paper trades (price: GC=F)"]
+    for _, t in open_.iterrows():
+        inf = open_trade_info(t, data)
+        if inf:
+            lines.append(f"#{t.id} {t.tf} {t.side} entry {t.entry} | now {inf['now']:.2f} "
+                         f"({inf['pnl']:+.2f})\nTP in {inf['to_tp']:.2f} | SL in {inf['to_sl']:.2f} "
+                         f"| candle {inf['n']}/{inf['max_n']}")
+    return "\n".join(lines)
+
+
+def status_due(hours: float) -> bool:
+    try:
+        last = json.load(open(STATE_FILE)).get("last_status")
+    except Exception:
+        last = None
+    if last is None:
+        return True
+    age = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds()
+    return age >= hours * 3600 - 120            # 2-minute tolerance for cron jitter
+
+
+def mark_status():
+    with open(STATE_FILE, "w") as f:
+        json.dump({"last_status": datetime.now(timezone.utc).isoformat()}, f)
+
+
+def print_stats(trades: pd.DataFrame, data: dict | None = None):
     print("\n📒 Paper-trading results")
-    closed = trades[trades["status"].isin(["TP", "SL"])]
+    closed = trades[trades["status"].isin(CLOSED)]
     open_ = trades[trades["status"] == "OPEN"]
     if closed.empty:
         print("  No closed trades yet.")
@@ -364,6 +412,11 @@ def print_stats(trades: pd.DataFrame):
         print(f"  Open trades ({len(open_)}):")
         for _, t in open_.iterrows():
             print(f"    #{t.id} {t.tf:>3} {t.side:<4} entry={t.entry} SL={t.sl} TP={t.tp}")
+            inf = open_trade_info(t, data) if data else None
+            if inf:
+                print(f"         now={inf['now']:.2f} ({inf['pnl']:+.2f}) | to TP {inf['to_tp']:.2f} | "
+                      f"to SL {inf['to_sl']:.2f} | candle {inf['n']}/{inf['max_n']}")
+                print(f"         since entry: low {inf['lo']:.2f} / high {inf['hi']:.2f} (this data feed)")
     print("  (points = USD move per ounce; before spread/commission)")
 
 
@@ -387,13 +440,15 @@ def run_once(args):
     trades = load_trades() if track else None
 
     if args.stats:
-        print_stats(update_trades(trades, data) if track else load_trades())
+        print_stats(update_trades(trades, data), data) if track else print_stats(load_trades(), data)
         return
 
     if args.loop:
         os.system("cls" if os.name == "nt" else "clear")
     print(f"Gold (XAU/USD) signals — {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC "
-          f"(closed candles only)\n")
+          f"(closed candles only)")
+    if not (args.demo or args.csv_dir):
+        print("Price source: Yahoo GC=F (gold futures) — can differ from broker spot XAUUSD\n")
 
     if args.backtest:
         print("Backtest (rule-based, no fees/slippage):")
@@ -418,7 +473,12 @@ def run_once(args):
         for sig in signals:
             trades = open_trade(trades, sig, alerts)
         trades.to_csv(TRADES_FILE, index=False)
-        print_stats(trades)
+        print_stats(trades, data)
+        open_now = trades[trades["status"] == "OPEN"]
+        if args.telegram and not open_now.empty and not alerts and (
+                args.status or (args.status_hours > 0 and status_due(args.status_hours))):
+            if tg_send(status_message(open_now, data)):
+                mark_status()
         if args.telegram and alerts:
             alerts[-1] += "\n\n" + stats_line(trades)
             for m in alerts:
@@ -435,6 +495,8 @@ if __name__ == "__main__":
     ap.add_argument("--no-track", action="store_true", help="don't write trades.csv")
     ap.add_argument("--loop", type=int, default=0, help="refresh seconds")
     ap.add_argument("--telegram", action="store_true", help="send alerts to Telegram")
+    ap.add_argument("--status", action="store_true", help="send open-trade status to Telegram now")
+    ap.add_argument("--status-hours", type=float, default=4, help="status report interval (0=off)")
     ap.add_argument("--telegram-test", action="store_true", help="send a test message and exit")
     ap.add_argument("--get-chat-id", action="store_true", help="print your Telegram chat ID and exit")
     a = ap.parse_args()
