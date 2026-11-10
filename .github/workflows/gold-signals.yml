@@ -38,5 +38,6 @@ jobs:
             git config user.name "gold-bot"
             git config user.email "gold-bot@users.noreply.github.com"
             git add trades.csv
+            [ -f state.json ] && git add state.json || true
             git diff --cached --quiet || (git commit -m "update trades" && git pull --rebase && git push)
           fi
